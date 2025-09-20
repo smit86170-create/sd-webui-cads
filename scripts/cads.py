@@ -50,6 +50,10 @@ class CADSExtensionScript(scripts.Script):
                         active = gr.Checkbox(value=False, default=False, label="Active", elem_id='cads_active')
                         rescale = gr.Checkbox(value=True, default=True, label="Rescale CFG", elem_id = 'cads_rescale')
                         with gr.Row():
+                                use_step_mode = gr.Checkbox(value=False, default=False, label="Use step sliders", elem_id='cads_use_step_mode', info='Convert Tau sliders to operate on absolute sampler steps instead of percentages.')
+                                step_start = gr.Slider(value = 0, minimum = 0, maximum = 150, step = 1, label="Tau 1 Step", elem_id = 'cads_tau1_step', info="Step on which CADS starts when using step sliders.", interactive=False)
+                                step_stop = gr.Slider(value = 0, minimum = 0, maximum = 150, step = 1, label="Tau 2 Step", elem_id = 'cads_tau2_step', info="Step on which CADS stops when using step sliders.", interactive=False)
+                        with gr.Row():
                                 t1 = gr.Slider(value = 0.6, minimum = 0.0, maximum = 1.0, step = 0.05, label="Tau 1", elem_id = 'cads_tau1', info="Step to start interpolating from full strength. Default 0.6")
                                 t2 = gr.Slider(value = 0.9, minimum = 0.0, maximum = 1.0, step = 0.05, label="Tau 2", elem_id = 'cads_tau2', info="Step to stop affecting image. Default 0.9")
                         with gr.Row():
@@ -57,8 +61,23 @@ class CADSExtensionScript(scripts.Script):
                                 mixing_factor= gr.Slider(value = 1.0, minimum = 0.0, maximum = 1.0, step = 0.01, label="Mixing Factor", elem_id = 'cads_mixing_factor', info='Regularization factor, lowering this will increase the diversity of the images with more chance of divergence, default 1.0')
                         with gr.Accordion('Experimental', open=False):
                                 apply_to_hr_pass = gr.Checkbox(value=False, default=False, label="Apply to Hires. Fix", elem_id='cads_hr_fix_active', info='Requires a very high denoising value to work. Default False')
+
+                def toggle_step_sliders(enabled):
+                        slider_state = gr.Slider.update(interactive=enabled)
+                        tau_state = gr.Slider.update(interactive=not enabled)
+                        return slider_state, slider_state, tau_state, tau_state
+
+                use_step_mode.change(
+                        fn=toggle_step_sliders,
+                        inputs=use_step_mode,
+                        outputs=[step_start, step_stop, t1, t2],
+                )
+
                 active.do_not_save_to_config = True
                 rescale.do_not_save_to_config = True
+                use_step_mode.do_not_save_to_config = True
+                step_start.do_not_save_to_config = True
+                step_stop.do_not_save_to_config = True
                 t1.do_not_save_to_config = True
                 t2.do_not_save_to_config = True
                 noise_scale.do_not_save_to_config = True
@@ -67,6 +86,9 @@ class CADSExtensionScript(scripts.Script):
                 self.infotext_fields = [
                         (active, lambda d: gr.Checkbox.update(value='CADS Active' in d)),
                         (rescale, 'CADS Rescale'),
+                        (use_step_mode, lambda d: gr.Checkbox.update(value=d.get('CADS Use Step Mode', False))),
+                        (step_start, 'CADS Tau 1 Step'),
+                        (step_stop, 'CADS Tau 2 Step'),
                         (t1, 'CADS Tau 1'),
                         (t2, 'CADS Tau 2'),
                         (noise_scale, 'CADS Noise Scale'),
@@ -76,21 +98,42 @@ class CADSExtensionScript(scripts.Script):
                 self.paste_field_names = [
                         'cads_active',
                         'cads_rescale',
+                        'cads_use_step_mode',
+                        'cads_tau1_step',
+                        'cads_tau2_step',
                         'cads_tau1',
                         'cads_tau2',
                         'cads_noise_scale',
                         'cads_mixing_factor',
                         'cads_hr_fix_active',
                 ]
-                return [active, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass]
+                return [active, use_step_mode, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass]
 
-        def before_process_batch(self, p, active, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass, *args, **kwargs):
+        def before_process_batch(self, p, active, use_step_mode, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass, *args, **kwargs):
                 self.unhook_callbacks()
                 active = getattr(p, "cads_active", active)
                 if active is False:
                         return
-                t1 = getattr(p, "cads_tau1", t1)
-                t2 = getattr(p, "cads_tau2", t2)
+                use_step_mode = getattr(p, "cads_use_step_mode", use_step_mode)
+                step_start = getattr(p, "cads_tau1_step", step_start)
+                step_stop = getattr(p, "cads_tau2_step", step_stop)
+                steps = getattr(p, "steps", -1)
+                if use_step_mode and steps <= 0:
+                        logger.error("Steps not set, disabling CADS step sliders")
+                        use_step_mode = False
+
+                if use_step_mode:
+                        step_start = int(max(min(step_start, steps), 0))
+                        step_stop = int(max(min(step_stop, steps), 0))
+                        if step_stop < step_start:
+                                step_stop = step_start
+                        t1 = max(min(step_start / steps, 1.0), 0.0)
+                        t2 = max(min(step_stop / steps, 1.0), 0.0)
+                else:
+                        step_start = 0
+                        step_stop = 0
+                        t1 = getattr(p, "cads_tau1", t1)
+                        t2 = getattr(p, "cads_tau2", t2)
                 noise_scale = getattr(p, "cads_noise_scale", noise_scale)
                 mixing_factor = getattr(p, "cads_mixing_factor", mixing_factor)
                 rescale = getattr(p, "cads_rescale", rescale)
@@ -101,8 +144,20 @@ class CADSExtensionScript(scripts.Script):
                         logger.error("Steps not set, disabling CADS")
                         return
 
+                setattr(p, "cads_use_step_mode", use_step_mode)
+                setattr(p, "cads_tau1_step", step_start)
+                setattr(p, "cads_tau2_step", step_stop)
+                setattr(p, "cads_tau1", t1)
+                setattr(p, "cads_tau2", t2)
+
+                if not hasattr(p, "extra_generation_params") or not isinstance(p.extra_generation_params, dict):
+                        p.extra_generation_params = {}
+
                 p.extra_generation_params.update({
                         "CADS Active": active,
+                        "CADS Use Step Mode": use_step_mode,
+                        "CADS Tau 1 Step": step_start,
+                        "CADS Tau 2 Step": step_stop,
                         "CADS Tau 1": t1,
                         "CADS Tau 2": t2,
                         "CADS Noise Scale": noise_scale,
@@ -120,7 +175,7 @@ class CADSExtensionScript(scripts.Script):
                 script_callbacks.on_cfg_denoiser(y)
                 script_callbacks.on_script_unloaded(self.unhook_callbacks)
 
-        def postprocess_batch(self, p, active, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass, *args, **kwargs):
+        def postprocess_batch(self, p, active, use_step_mode, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass, *args, **kwargs):
                 self.unhook_callbacks()
 
         def unhook_callbacks(self):
@@ -200,6 +255,9 @@ class CADSExtensionScript(scripts.Script):
                 noise_scale = params.get("CADS Noise Scale", None)
                 mixing_factor = params.get("CADS Mixing Factor", None)
                 rescale = params.get("CADS Rescale", None)
+                use_step_mode = params.get("CADS Use Step Mode", False)
+                step_start = params.get("CADS Tau 1 Step", 0)
+                step_stop = params.get("CADS Tau 2 Step", 0)
 
                 if t1 is None or t2 is None or noise_scale is None or mixing_factor is None or rescale is None:
                         logger.error("Missing needed parameters for Hires. fix")
@@ -212,6 +270,18 @@ class CADSExtensionScript(scripts.Script):
                 if hr_pass_steps == 0:
                         logger.debug("Using first pass step count for hires. fix")
                         hr_pass_steps = getattr(p, "steps", -1)
+
+                if use_step_mode and hr_pass_steps > 0:
+                        step_start = int(max(min(step_start, hr_pass_steps), 0))
+                        step_stop = int(max(min(step_stop, hr_pass_steps), 0))
+                        if step_stop < step_start:
+                                step_stop = step_start
+                        t1 = max(min(step_start / hr_pass_steps, 1.0), 0.0)
+                        t2 = max(min(step_stop / hr_pass_steps, 1.0), 0.0)
+                        params["CADS Tau 1 Step"] = step_start
+                        params["CADS Tau 2 Step"] = step_stop
+                        params["CADS Tau 1"] = t1
+                        params["CADS Tau 2"] = t2
 
                 logger.debug("Enabled for hi-res fix with %i steps, re-hooking CADS", hr_pass_steps)
                 self.create_hook(p, active, t1, t2, noise_scale, mixing_factor, rescale, hr_pass_steps)
@@ -234,6 +304,15 @@ def cads_apply_field(field):
 
     return fun
 
+def cads_apply_step_field(field):
+    def fun(p, x, xs):
+        if not hasattr(p, "cads_active"):
+                setattr(p, "cads_active", True)
+        setattr(p, "cads_use_step_mode", True)
+        setattr(p, field, x)
+
+    return fun
+
 def make_axis_options():
         xyz_grid = [x for x in scripts.scripts_data if x.script_class.__module__ in ("xyz_grid.py", "scripts.xyz_grid")][0].module
         # Add the boolean choice function to SD.Next XYZ Grid script
@@ -242,6 +321,9 @@ def make_axis_options():
         extra_axis_options = {
                 xyz_grid.AxisOption("[CADS] Active", str, cads_apply_override('cads_active', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
                 xyz_grid.AxisOption("[CADS] Rescale CFG", str, cads_apply_override('cads_rescale', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
+                xyz_grid.AxisOption("[CADS] Use Step Mode", str, cads_apply_override('cads_use_step_mode', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
+                xyz_grid.AxisOption("[CADS] Tau 1 Step", int, cads_apply_step_field("cads_tau1_step")),
+                xyz_grid.AxisOption("[CADS] Tau 2 Step", int, cads_apply_step_field("cads_tau2_step")),
                 xyz_grid.AxisOption("[CADS] Tau 1", float, cads_apply_field("cads_tau1")),
                 xyz_grid.AxisOption("[CADS] Tau 2", float, cads_apply_field("cads_tau2")),
                 xyz_grid.AxisOption("[CADS] Noise Scale", float, cads_apply_field("cads_noise_scale")),
