@@ -51,6 +51,7 @@ class CADSExtensionScript(scripts.Script):
                         rescale = gr.Checkbox(value=True, default=True, label="Rescale CFG", elem_id = 'cads_rescale')
                         with gr.Row():
                                 use_step_mode = gr.Checkbox(value=False, default=False, label="Use step sliders", elem_id='cads_use_step_mode', info='Convert Tau sliders to operate on absolute sampler steps instead of percentages.')
+                                respect_strength = gr.Checkbox(value=False, default=False, label="Scale steps by strength", elem_id='cads_respect_strength', info='When enabled, CADS step sliders account for denoising strength / t_enc for img2img and hires. fix passes.', interactive=False)
                                 step_start = gr.Slider(value = 0, minimum = 0, maximum = 150, step = 1, label="Tau 1 Step", elem_id = 'cads_tau1_step', info="Step on which CADS starts when using step sliders.", interactive=False)
                                 step_stop = gr.Slider(value = 0, minimum = 0, maximum = 150, step = 1, label="Tau 2 Step", elem_id = 'cads_tau2_step', info="Step on which CADS stops when using step sliders.", interactive=False)
                         with gr.Row():
@@ -65,17 +66,19 @@ class CADSExtensionScript(scripts.Script):
                 def toggle_step_sliders(enabled):
                         slider_state = gr.Slider.update(interactive=enabled)
                         tau_state = gr.Slider.update(interactive=not enabled)
-                        return slider_state, slider_state, tau_state, tau_state
+                        checkbox_state = gr.Checkbox.update(interactive=enabled)
+                        return slider_state, slider_state, tau_state, tau_state, checkbox_state
 
                 use_step_mode.change(
                         fn=toggle_step_sliders,
                         inputs=use_step_mode,
-                        outputs=[step_start, step_stop, t1, t2],
+                        outputs=[step_start, step_stop, t1, t2, respect_strength],
                 )
 
                 active.do_not_save_to_config = True
                 rescale.do_not_save_to_config = True
                 use_step_mode.do_not_save_to_config = True
+                respect_strength.do_not_save_to_config = True
                 step_start.do_not_save_to_config = True
                 step_stop.do_not_save_to_config = True
                 t1.do_not_save_to_config = True
@@ -87,6 +90,7 @@ class CADSExtensionScript(scripts.Script):
                         (active, lambda d: gr.Checkbox.update(value='CADS Active' in d)),
                         (rescale, 'CADS Rescale'),
                         (use_step_mode, lambda d: gr.Checkbox.update(value=d.get('CADS Use Step Mode', False))),
+                        (respect_strength, lambda d: gr.Checkbox.update(value=d.get('CADS Respect Strength', False))),
                         (step_start, 'CADS Tau 1 Step'),
                         (step_stop, 'CADS Tau 2 Step'),
                         (t1, 'CADS Tau 1'),
@@ -99,6 +103,7 @@ class CADSExtensionScript(scripts.Script):
                         'cads_active',
                         'cads_rescale',
                         'cads_use_step_mode',
+                        'cads_respect_strength',
                         'cads_tau1_step',
                         'cads_tau2_step',
                         'cads_tau1',
@@ -107,14 +112,15 @@ class CADSExtensionScript(scripts.Script):
                         'cads_mixing_factor',
                         'cads_hr_fix_active',
                 ]
-                return [active, use_step_mode, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass]
+                return [active, use_step_mode, respect_strength, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass]
 
-        def before_process_batch(self, p, active, use_step_mode, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass, *args, **kwargs):
+        def before_process_batch(self, p, active, use_step_mode, respect_strength, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass, *args, **kwargs):
                 self.unhook_callbacks()
                 active = getattr(p, "cads_active", active)
                 if active is False:
                         return
                 use_step_mode = getattr(p, "cads_use_step_mode", use_step_mode)
+                respect_strength = getattr(p, "cads_respect_strength", respect_strength)
                 step_start = getattr(p, "cads_tau1_step", step_start)
                 step_stop = getattr(p, "cads_tau2_step", step_stop)
                 steps = getattr(p, "steps", -1)
@@ -122,12 +128,34 @@ class CADSExtensionScript(scripts.Script):
                         logger.error("Steps not set, disabling CADS step sliders")
                         use_step_mode = False
 
+                strength_scale = 1.0
+                effective_steps_float = float(max(steps, 1))
+                effective_step_count = max(int(round(effective_steps_float)), 1)
                 if use_step_mode:
                         step_start = int(max(min(step_start, steps), 0))
                         step_stop = int(max(min(step_stop, steps), 0))
                         if step_stop < step_start:
                                 step_stop = step_start
                         steps_float = float(max(steps, 1))
+                        if respect_strength:
+                                strength_raw = getattr(p, "denoising_strength", None)
+                                try:
+                                        strength_scale = float(strength_raw)
+                                except (TypeError, ValueError):
+                                        strength_scale = 1.0
+                                if not np.isfinite(strength_scale):
+                                        strength_scale = 1.0
+                                strength_scale = max(min(strength_scale, 1.0), 0.0)
+                                if strength_scale == 0.0:
+                                        logger.warning("CADS: Denoising strength is 0.0, falling back to 1.0 for step conversion")
+                                        strength_scale = 1.0
+                                effective_steps_float = max(steps_float * strength_scale, 1.0)
+                                effective_step_count = max(int(round(effective_steps_float)), 1)
+                                step_start = int(max(min(step_start, effective_step_count), 0))
+                                step_stop = int(max(min(step_stop, effective_step_count), 0))
+                                if step_stop < step_start:
+                                        step_stop = step_start
+                                steps_float = effective_steps_float
                         t1 = max(min(1.0 - (step_stop / steps_float), 1.0), 0.0)
                         t2 = max(min(1.0 - (step_start / steps_float), 1.0), 0.0)
                 else:
@@ -135,6 +163,8 @@ class CADSExtensionScript(scripts.Script):
                         step_stop = 0
                         t1 = getattr(p, "cads_tau1", t1)
                         t2 = getattr(p, "cads_tau2", t2)
+                        strength_scale = 1.0
+                        effective_step_count = max(int(round(float(max(steps, 1)))), 1)
                 noise_scale = getattr(p, "cads_noise_scale", noise_scale)
                 mixing_factor = getattr(p, "cads_mixing_factor", mixing_factor)
                 rescale = getattr(p, "cads_rescale", rescale)
@@ -146,10 +176,13 @@ class CADSExtensionScript(scripts.Script):
                         return
 
                 setattr(p, "cads_use_step_mode", use_step_mode)
+                setattr(p, "cads_respect_strength", respect_strength)
                 setattr(p, "cads_tau1_step", step_start)
                 setattr(p, "cads_tau2_step", step_stop)
                 setattr(p, "cads_tau1", t1)
                 setattr(p, "cads_tau2", t2)
+                setattr(p, "cads_strength_scale", strength_scale)
+                setattr(p, "cads_effective_steps", effective_step_count)
 
                 if not hasattr(p, "extra_generation_params") or not isinstance(p.extra_generation_params, dict):
                         p.extra_generation_params = {}
@@ -157,6 +190,7 @@ class CADSExtensionScript(scripts.Script):
                 p.extra_generation_params.update({
                         "CADS Active": active,
                         "CADS Use Step Mode": use_step_mode,
+                        "CADS Respect Strength": respect_strength,
                         "CADS Tau 1 Step": step_start,
                         "CADS Tau 2 Step": step_stop,
                         "CADS Tau 1": t1,
@@ -165,8 +199,10 @@ class CADSExtensionScript(scripts.Script):
                         "CADS Mixing Factor": mixing_factor,
                         "CADS Rescale": rescale,
                         "CADS Apply To Hires. Fix": apply_to_hr_pass,
+                        "CADS Strength Scale": strength_scale,
+                        "CADS Effective Steps": effective_step_count,
                 })
-                self.create_hook(p, active, t1, t2, noise_scale, mixing_factor, rescale, first_pass_steps)
+                self.create_hook(p, active, t1, t2, noise_scale, mixing_factor, rescale, effective_step_count)
         
         def create_hook(self, p, active, t1, t2, noise_scale, mixing_factor, rescale, total_sampling_steps, *args, **kwargs):
                 # Use lambda to call the callback function with the parameters to avoid global variables
@@ -176,7 +212,7 @@ class CADSExtensionScript(scripts.Script):
                 script_callbacks.on_cfg_denoiser(y)
                 script_callbacks.on_script_unloaded(self.unhook_callbacks)
 
-        def postprocess_batch(self, p, active, use_step_mode, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass, *args, **kwargs):
+        def postprocess_batch(self, p, active, use_step_mode, respect_strength, step_start, step_stop, t1, t2, noise_scale, mixing_factor, rescale, apply_to_hr_pass, *args, **kwargs):
                 self.unhook_callbacks()
 
         def unhook_callbacks(self):
@@ -257,6 +293,7 @@ class CADSExtensionScript(scripts.Script):
                 mixing_factor = params.get("CADS Mixing Factor", None)
                 rescale = params.get("CADS Rescale", None)
                 use_step_mode = params.get("CADS Use Step Mode", False)
+                respect_strength = params.get("CADS Respect Strength", False)
                 step_start = params.get("CADS Tau 1 Step", 0)
                 step_stop = params.get("CADS Tau 2 Step", 0)
 
@@ -273,20 +310,41 @@ class CADSExtensionScript(scripts.Script):
                         hr_pass_steps = getattr(p, "steps", -1)
 
                 if use_step_mode and hr_pass_steps > 0:
-                        step_start = int(max(min(step_start, hr_pass_steps), 0))
-                        step_stop = int(max(min(step_stop, hr_pass_steps), 0))
+                        steps_float = float(max(hr_pass_steps, 1))
+                        strength_scale = params.get("CADS Strength Scale", 1.0)
+                        if respect_strength:
+                                strength_raw = getattr(p, "hr_denoising_strength", getattr(p, "denoising_strength", None))
+                                try:
+                                        strength_scale = float(strength_raw)
+                                except (TypeError, ValueError):
+                                        strength_scale = 1.0
+                                if not np.isfinite(strength_scale):
+                                        strength_scale = 1.0
+                                strength_scale = max(min(strength_scale, 1.0), 0.0)
+                                if strength_scale == 0.0:
+                                        logger.warning("CADS: Hires. fix denoising strength is 0.0, falling back to 1.0 for step conversion")
+                                        strength_scale = 1.0
+                                steps_float = max(steps_float * strength_scale, 1.0)
+                        effective_step_count = max(int(round(steps_float)), 1)
+                        step_start = int(max(min(step_start, effective_step_count), 0))
+                        step_stop = int(max(min(step_stop, effective_step_count), 0))
                         if step_stop < step_start:
                                 step_stop = step_start
-                        steps_float = float(max(hr_pass_steps, 1))
                         t1 = max(min(1.0 - (step_stop / steps_float), 1.0), 0.0)
                         t2 = max(min(1.0 - (step_start / steps_float), 1.0), 0.0)
                         params["CADS Tau 1 Step"] = step_start
                         params["CADS Tau 2 Step"] = step_stop
                         params["CADS Tau 1"] = t1
                         params["CADS Tau 2"] = t2
+                        if respect_strength:
+                                params["CADS Strength Scale"] = strength_scale
+                                params["CADS Effective Steps"] = effective_step_count
 
                 logger.debug("Enabled for hi-res fix with %i steps, re-hooking CADS", hr_pass_steps)
-                self.create_hook(p, active, t1, t2, noise_scale, mixing_factor, rescale, hr_pass_steps)
+                total_sampling_steps = hr_pass_steps
+                if use_step_mode and respect_strength:
+                        total_sampling_steps = params.get("CADS Effective Steps", max(int(round(float(max(hr_pass_steps, 1)))), 1))
+                self.create_hook(p, active, t1, t2, noise_scale, mixing_factor, rescale, total_sampling_steps)
 
 
 # XYZ Plot
@@ -324,6 +382,7 @@ def make_axis_options():
                 xyz_grid.AxisOption("[CADS] Active", str, cads_apply_override('cads_active', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
                 xyz_grid.AxisOption("[CADS] Rescale CFG", str, cads_apply_override('cads_rescale', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
                 xyz_grid.AxisOption("[CADS] Use Step Mode", str, cads_apply_override('cads_use_step_mode', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
+                xyz_grid.AxisOption("[CADS] Respect Strength", str, cads_apply_override('cads_respect_strength', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
                 xyz_grid.AxisOption("[CADS] Tau 1 Step", int, cads_apply_step_field("cads_tau1_step")),
                 xyz_grid.AxisOption("[CADS] Tau 2 Step", int, cads_apply_step_field("cads_tau2_step")),
                 xyz_grid.AxisOption("[CADS] Tau 1", float, cads_apply_field("cads_tau1")),
