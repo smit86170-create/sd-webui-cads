@@ -14,6 +14,7 @@ except ImportError:
         from torch import randn_like
 
 import torch
+import math  # <-- FIX: для безопасной математики без numpy-скаляров
 
 logger = logging.getLogger(__name__)
 logger.setLevel(environ.get("SD_WEBUI_LOG_LEVEL", logging.INFO))
@@ -221,11 +222,19 @@ class CADSExtensionScript(scripts.Script):
 
         def cads_linear_schedule(self, t, tau1, tau2):
                 """ CADS annealing schedule function """
+                # FIX: защита от выходов за диапазон и tau1==tau2
+                tau1 = float(max(min(tau1, 1.0), 0.0))
+                tau2 = float(max(min(tau2, 1.0), 0.0))
+                if tau1 >= tau2:
+                        return 1.0 if t <= tau1 else 0.0
                 if t <= tau1:
                         return 1.0
-                if t>= tau2:
+                if t >= tau2:
                         return 0.0
-                gamma = (tau2-t)/(tau2-tau1)
+                denom = (tau2 - tau1)
+                if denom <= 1e-12:
+                        return 0.0 if t >= tau2 else 1.0
+                gamma = (tau2-t)/denom
                 return gamma
 
         def add_noise(self, y, gamma, noise_scale, psi, rescale=False):
@@ -239,13 +248,20 @@ class CADSExtensionScript(scripts.Script):
                 rescale (bool): Rescale the condition
                 """
                 y_mean, y_std = torch.mean(y), torch.std(y)
-                y = np.sqrt(gamma) * y + noise_scale * np.sqrt(1-gamma) * randn_like(y)
+                # FIX: избавляемся от numpy.float64 в умножении на torch.Tensor
+                gamma_sqrt = math.sqrt(float(gamma))
+                one_minus_gamma_sqrt = math.sqrt(float(1.0 - gamma))
+                y = gamma_sqrt * y + noise_scale * one_minus_gamma_sqrt * randn_like(y)
                 if rescale:
-                        y_scaled = (y - torch.mean(y)) / torch.std(y) * y_std + y_mean
-                        if not torch.isnan(y_scaled).any():
-                                y = psi * y_scaled + (1 - psi) * y
+                        denom = torch.std(y)
+                        if denom == 0:
+                                logger.debug("Warning: zero standard deviation encountered during rescaling")
                         else:
-                                logger.debug("Warning: NaN encountered in rescaling")
+                                y_scaled = (y - torch.mean(y)) / denom * y_std + y_mean
+                                if not torch.isnan(y_scaled).any():
+                                        y = psi * y_scaled + (1 - psi) * y
+                                else:
+                                        logger.debug("Warning: NaN encountered in rescaling")
                 return y
 
         def on_cfg_denoiser_callback(self, params: CFGDenoiserParams, t1, t2, noise_scale, mixing_factor, rescale, total_sampling_steps):
@@ -264,7 +280,7 @@ class CADSExtensionScript(scripts.Script):
                         params.text_cond = self.add_noise(text_cond, gamma, noise_scale, mixing_factor, rescale)
                         params.text_uncond = self.add_noise(text_uncond, gamma, noise_scale, mixing_factor, rescale)
                 # SDXL
-                elif isinstance(text_cond, Union[dict, OrderedDict]) and isinstance(text_uncond, Union[dict, OrderedDict]):
+                elif isinstance(text_cond, (dict, OrderedDict)) and isinstance(text_uncond, (dict, OrderedDict)):  # <-- FIX: правильный isinstance
                         params.text_cond['crossattn'] = self.add_noise(text_cond['crossattn'], gamma, noise_scale, mixing_factor, rescale)
                         params.text_uncond['crossattn'] = self.add_noise(text_uncond['crossattn'], gamma, noise_scale, mixing_factor, rescale)
                         params.text_cond['vector'] = self.add_noise(text_cond['vector'], gamma, noise_scale, mixing_factor, rescale)
@@ -381,7 +397,8 @@ def make_axis_options():
         # Add the boolean choice function to SD.Next XYZ Grid script
         if not hasattr(xyz_grid, "boolean_choice"):
                 xyz_grid.boolean_choice = lambda reverse=False: ["True", "False"] if not reverse else ["False", "True"]
-        extra_axis_options = {
+        # FIX: детерминированный порядок (list вместо set)
+        extra_axis_options = [
                 xyz_grid.AxisOption("[CADS] Active", str, cads_apply_override('cads_active', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
                 xyz_grid.AxisOption("[CADS] Rescale CFG", str, cads_apply_override('cads_rescale', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
                 xyz_grid.AxisOption("[CADS] Use Step Mode", str, cads_apply_override('cads_use_step_mode', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
@@ -393,7 +410,7 @@ def make_axis_options():
                 xyz_grid.AxisOption("[CADS] Noise Scale", float, cads_apply_field("cads_noise_scale")),
                 xyz_grid.AxisOption("[CADS] Mixing Factor", float, cads_apply_field("cads_mixing_factor")),
                 xyz_grid.AxisOption("[CADS] Apply to Hires. Fix", str, cads_apply_override('cads_hr_fix_active', boolean=True), choices=xyz_grid.boolean_choice(reverse=True)),
-        }
+        ]
         if not any("[CADS]" in x.label for x in xyz_grid.axis_options):
                 xyz_grid.axis_options.extend(extra_axis_options)
 
