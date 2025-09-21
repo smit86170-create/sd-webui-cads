@@ -127,8 +127,9 @@ class CADSExtensionScript(scripts.Script):
                         step_stop = int(max(min(step_stop, steps), 0))
                         if step_stop < step_start:
                                 step_stop = step_start
-                        t1 = max(min(step_start / steps, 1.0), 0.0)
-                        t2 = max(min(step_stop / steps, 1.0), 0.0)
+                        steps_float = float(max(steps, 1))
+                        t1 = max(min(1.0 - (step_stop / steps_float), 1.0), 0.0)
+                        t2 = max(min(1.0 - (step_start / steps_float), 1.0), 0.0)
                 else:
                         step_start = 0
                         step_stop = 0
@@ -276,8 +277,9 @@ class CADSExtensionScript(scripts.Script):
                         step_stop = int(max(min(step_stop, hr_pass_steps), 0))
                         if step_stop < step_start:
                                 step_stop = step_start
-                        t1 = max(min(step_start / hr_pass_steps, 1.0), 0.0)
-                        t2 = max(min(step_stop / hr_pass_steps, 1.0), 0.0)
+                        steps_float = float(max(hr_pass_steps, 1))
+                        t1 = max(min(1.0 - (step_stop / steps_float), 1.0), 0.0)
+                        t2 = max(min(1.0 - (step_start / steps_float), 1.0), 0.0)
                         params["CADS Tau 1 Step"] = step_start
                         params["CADS Tau 2 Step"] = step_stop
                         params["CADS Tau 1"] = t1
