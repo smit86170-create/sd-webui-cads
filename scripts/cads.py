@@ -254,7 +254,10 @@ class CADSExtensionScript(scripts.Script):
                 text_cond = params.text_cond
                 text_uncond = params.text_uncond
 
-                t = 1.0 - max(min(sampling_step / total_sampling_step, 1.0), 0.0) # Algorithms assumes we start at 1.0 and go to 0.0
+                # CADS step sliders are expressed using 1-indexed sampler steps, so bump the
+                # callback step before converting to the [0, 1] time domain. This ensures the
+                # first sampled step participates when the start slider is set to 0.
+                t = 1.0 - max(min((sampling_step + 1) / total_sampling_step, 1.0), 0.0) # Algorithms assumes we start at 1.0 and go to 0.0
                 gamma = self.cads_linear_schedule(t, t1, t2)
                 # SD 1.5
                 if isinstance(text_cond, torch.Tensor) and isinstance(text_uncond, torch.Tensor):
