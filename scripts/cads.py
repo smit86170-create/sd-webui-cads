@@ -19,6 +19,49 @@ except ImportError:  # Automatic1111 < 1.7 compatibility
 logger = logging.getLogger(__name__)
 logger.setLevel(environ.get("SD_WEBUI_LOG_LEVEL", logging.INFO))
 
+
+def parse_bool(val, default=False):
+    try:
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            val_lower = val.lower()
+            if val_lower in ("true", "1", "yes", "on"):
+                return True
+            if val_lower in ("false", "0", "no", "off"):
+                return False
+        if isinstance(val, (int, float)):
+            return bool(val)
+    except Exception:
+        pass
+    return default
+
+
+def parse_int(val, default=0):
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_randn_like(x, generator=None):
+    """
+    Safe randn_like wrapper that tolerates A1111/forge variants where modules.rng.randn_like
+    may not support the generator kwarg.
+    """
+    try:
+        if generator is not None:
+            return randn_like(x, generator=generator)
+        return randn_like(x)
+    except TypeError:
+        # Fallback to torch implementation if generator is passed but unsupported.
+        if generator is not None:
+            try:
+                return torch.randn_like(x, generator=generator)
+            except TypeError:
+                return torch.randn_like(x)
+        return torch.randn_like(x)
+
 """
 An implementation of CADS: Unleashing the Diversity of Diffusion Models through
 Condition-Annealed Sampling for Automatic1111 WebUI
@@ -37,9 +80,39 @@ GitHub URL: https://github.com/v0xie/sd-webui-cads
 """
 
 STEP_RAMP_MODES = ("Hold after full", "Windowed 0→1", "Windowed 1→0")
+DEFAULT_TAU1 = 0.6
+DEFAULT_TAU2 = 0.9
+DEFAULT_NOISE_SCALE = 0.25
+DEFAULT_MIXING_FACTOR = 1.0
+DEFAULT_SEED = -1
+PRESETS = {
+    "Subtle": {
+        "tau1": 0.85,
+        "tau2": 0.95,
+        "noise_scale": 0.15,
+        "mixing_factor": 1.0,
+    },
+    "Balanced": {
+        "tau1": DEFAULT_TAU1,
+        "tau2": DEFAULT_TAU2,
+        "noise_scale": DEFAULT_NOISE_SCALE,
+        "mixing_factor": DEFAULT_MIXING_FACTOR,
+    },
+    "Aggressive": {
+        "tau1": 0.4,
+        "tau2": 0.7,
+        "noise_scale": 0.3,
+        "mixing_factor": 0.8,
+    },
+}
 
 
 class CADSExtensionScript(scripts.Script):
+    def __init__(self):
+        super().__init__()
+        self.cads_generators = {}
+        self.logged_unknown_conditioning = False
+
     # Extension title in menu UI
     def title(self):
         return "CADS"
@@ -75,51 +148,51 @@ class CADSExtensionScript(scripts.Script):
                     label="Step ramp mode",
                     elem_id="cads_step_ramp_mode",
                     info="How CADS strength behaves relative to the chosen step window.",
-                    interactive=False,
+                    interactive=True,
                 )
             with gr.Row():
                 step_start = gr.Slider(
                     value=0,
                     minimum=0,
-                    maximum=150,
+                    maximum=1000,
                     step=1,
-                    label="Tau 1 Step",
+                    label="Ramp start step (Tau 2)",
                     elem_id="cads_tau1_step",
-                    info="Step on which CADS starts when using step sliders.",
+                    info="Sampler step where CADS starts ramping in from 0 → 1 when using step sliders (corresponds to Tau 2 step).",
                     interactive=False,
                 )
                 step_stop = gr.Slider(
                     value=0,
                     minimum=0,
-                    maximum=150,
+                    maximum=1000,
                     step=1,
-                    label="Tau 2 Step",
+                    label="Full strength step (Tau 1)",
                     elem_id="cads_tau2_step",
-                    info="Step on which CADS stops when using step sliders.",
+                    info="Sampler step where CADS reaches full strength before following the selected ramp mode (corresponds to Tau 1 step).",
                     interactive=False,
                 )
             with gr.Row():
                 t1 = gr.Slider(
-                    value=0.6,
+                    value=DEFAULT_TAU1,
                     minimum=0.0,
                     maximum=1.0,
                     step=0.05,
-                    label="Tau 1",
+                    label="Tau 1 (full strength point)",
                     elem_id="cads_tau1",
-                    info="Step to reach full strength (hold after). Default 0.6",
+                    info="Normalized point where CADS reaches full strength; smaller values push CADS later in the schedule. Default 0.6",
                 )
                 t2 = gr.Slider(
-                    value=0.9,
+                    value=DEFAULT_TAU2,
                     minimum=0.0,
                     maximum=1.0,
                     step=0.05,
-                    label="Tau 2",
+                    label="Tau 2 (ramp start)",
                     elem_id="cads_tau2",
-                    info="Step to stop affecting image (start of ramp). Default 0.9",
+                    info="Normalized point where CADS starts ramping in from 0 → 1; higher values start earlier in the schedule. Default 0.9",
                 )
             with gr.Row():
                 noise_scale = gr.Slider(
-                    value=0.25,
+                    value=DEFAULT_NOISE_SCALE,
                     minimum=0.0,
                     maximum=1.0,
                     step=0.01,
@@ -128,7 +201,7 @@ class CADSExtensionScript(scripts.Script):
                     info="Scale of noise injected at every time step, default 0.25, recommended <= 0.3",
                 )
                 mixing_factor = gr.Slider(
-                    value=1.0,
+                    value=DEFAULT_MIXING_FACTOR,
                     minimum=0.0,
                     maximum=1.0,
                     step=0.01,
@@ -144,12 +217,65 @@ class CADSExtensionScript(scripts.Script):
                     elem_id="cads_hr_fix_active",
                     info="Requires a very high denoising value to work. Default False",
                 )
+            with gr.Row():
+                apply_to_positive = gr.Checkbox(
+                    value=True,
+                    default=True,
+                    label="Apply to Positive",
+                    elem_id="cads_apply_positive",
+                )
+                apply_to_negative = gr.Checkbox(
+                    value=True,
+                    default=True,
+                    label="Apply to Negative",
+                    elem_id="cads_apply_negative",
+                )
+            with gr.Row():
+                presets = gr.Dropdown(
+                    value="Balanced",
+                    choices=list(PRESETS.keys()),
+                    label="Presets",
+                    elem_id="cads_preset",
+                    info="Quickly load suggested Tau and noise settings.",
+                )
+                reset = gr.Button(value="Reset", elem_id="cads_reset")
+            with gr.Row():
+                cads_seed = gr.Number(
+                    value=DEFAULT_SEED,
+                    precision=0,
+                    label="CADS Seed",
+                    elem_id="cads_seed",
+                    info="Seed used only for CADS noise (-1 follows main randomness).",
+                )
+                cads_seed_fixed = gr.Checkbox(
+                    value=False,
+                    default=False,
+                    label="Fixed CADS Seed",
+                    elem_id="cads_seed_fixed",
+                    info="Use a dedicated RNG for CADS noise so it can be varied independently from the main seed.",
+                )
+            with gr.Row():
+                same_noise_per_image = gr.Checkbox(
+                    value=False,
+                    default=False,
+                    label="Same CADS noise across batch",
+                    elem_id="cads_same_noise_per_image",
+                    info="Requires a fixed CADS seed. When enabled, each image in a batch receives identical CADS noise per step (helpful for side-by-side comparisons).",
+                    interactive=False,
+                )
+                share_noise_posneg = gr.Checkbox(
+                    value=False,
+                    default=False,
+                    label="Share noise between pos/neg",
+                    elem_id="cads_share_noise_posneg",
+                    info="When enabled, positive and negative conditionings share the same CADS noise sample per step.",
+                )
 
         def toggle_step_sliders(enabled):
             slider_enabled = gr.Slider.update(interactive=enabled)
             slider_disabled = gr.Slider.update(interactive=not enabled)
             checkbox_enabled = gr.Checkbox.update(interactive=enabled)
-            dropdown_enabled = gr.Dropdown.update(interactive=enabled)
+            dropdown_enabled = gr.Dropdown.update(interactive=True)
             return (
                 slider_enabled,
                 slider_enabled,
@@ -165,6 +291,59 @@ class CADSExtensionScript(scripts.Script):
             outputs=[step_start, step_stop, t1, t2, respect_strength, step_ramp_mode],
         )
 
+        def update_same_noise_enabled(seed_val, fixed):
+            seed_int = parse_int(seed_val, DEFAULT_SEED)
+            has_fixed_seed = seed_int >= 0 or parse_bool(fixed, False)
+            info = "Requires a fixed CADS seed. When enabled, each image in a batch receives identical CADS noise per step (helpful for comparisons)."
+            if has_fixed_seed:
+                return gr.Checkbox.update(interactive=True, info=info)
+            return gr.Checkbox.update(interactive=False, value=False, info=info)
+
+        cads_seed.change(
+            fn=update_same_noise_enabled,
+            inputs=[cads_seed, cads_seed_fixed],
+            outputs=same_noise_per_image,
+        )
+        cads_seed_fixed.change(
+            fn=update_same_noise_enabled,
+            inputs=[cads_seed, cads_seed_fixed],
+            outputs=same_noise_per_image,
+        )
+
+        def apply_preset(preset_name):
+            preset = PRESETS.get(preset_name, PRESETS["Balanced"])
+            return (
+                gr.Slider.update(value=preset["tau2"]),
+                gr.Slider.update(value=preset["tau1"]),
+                gr.Slider.update(value=preset["noise_scale"]),
+                gr.Slider.update(value=preset["mixing_factor"]),
+                gr.Number.update(value=DEFAULT_SEED),
+                gr.Checkbox.update(value=False),
+            )
+
+        presets.change(
+            fn=apply_preset,
+            inputs=presets,
+            outputs=[t2, t1, noise_scale, mixing_factor, cads_seed, cads_seed_fixed],
+        )
+
+        def reset_defaults():
+            return (
+                gr.Slider.update(value=DEFAULT_TAU2),
+                gr.Slider.update(value=DEFAULT_TAU1),
+                gr.Slider.update(value=DEFAULT_NOISE_SCALE),
+                gr.Slider.update(value=DEFAULT_MIXING_FACTOR),
+                gr.Dropdown.update(value="Balanced"),
+                gr.Number.update(value=DEFAULT_SEED),
+                gr.Checkbox.update(value=False),
+            )
+
+        reset.click(
+            fn=reset_defaults,
+            inputs=None,
+            outputs=[t2, t1, noise_scale, mixing_factor, presets, cads_seed, cads_seed_fixed],
+        )
+
         active.do_not_save_to_config = True
         rescale.do_not_save_to_config = True
         use_step_mode.do_not_save_to_config = True
@@ -172,18 +351,20 @@ class CADSExtensionScript(scripts.Script):
         step_ramp_mode.do_not_save_to_config = True
         step_start.do_not_save_to_config = True
         step_stop.do_not_save_to_config = True
-        t1.do_not_save_to_config = True
-        t2.do_not_save_to_config = True
-        noise_scale.do_not_save_to_config = True
-        mixing_factor.do_not_save_to_config = True
         apply_to_hr_pass.do_not_save_to_config = True
+        presets.do_not_save_to_config = True
+        reset.do_not_save_to_config = True
+        cads_seed_fixed.do_not_save_to_config = True
+        same_noise_per_image.do_not_save_to_config = True
+        share_noise_posneg.do_not_save_to_config = True
 
+        # Keep Tau step infotext keys as legacy names for backward compatibility with existing images.
         self.infotext_fields = [
-            (active, lambda d: gr.Checkbox.update(value="CADS Active" in d)),
-            (rescale, "CADS Rescale"),
-            (use_step_mode, lambda d: gr.Checkbox.update(value=d.get("CADS Use Step Mode", False))),
-            (respect_strength, lambda d: gr.Checkbox.update(value=d.get("CADS Respect Strength", False))),
-            (step_ramp_mode, lambda d: gr.Dropdown.update(value=d.get("CADS Step Ramp Mode", STEP_RAMP_MODES[0]))),
+            (active, lambda d: gr.Checkbox.update(value=str(d.get("CADS Active", "False")).lower() == "true")),
+            (rescale, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Rescale", True), True))),
+            (use_step_mode, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Use Step Mode", False), False))),
+            (respect_strength, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Respect Strength", False), False))),
+            (step_ramp_mode, lambda d: gr.Dropdown.update(value=d.get("CADS Step Ramp Mode", STEP_RAMP_MODES[0]) if d.get("CADS Step Ramp Mode", STEP_RAMP_MODES[0]) in STEP_RAMP_MODES else STEP_RAMP_MODES[0])),
             (step_start, "CADS Tau 1 Step"),
             (step_stop, "CADS Tau 2 Step"),
             (t1, "CADS Tau 1"),
@@ -191,6 +372,13 @@ class CADSExtensionScript(scripts.Script):
             (noise_scale, "CADS Noise Scale"),
             (mixing_factor, "CADS Mixing Factor"),
             (apply_to_hr_pass, "CADS Apply To Hires. Fix"),
+            (apply_to_positive, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Apply To Positive", True), True))),
+            (apply_to_negative, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Apply To Negative", True), True))),
+            (presets, lambda d: gr.Dropdown.update(value=d.get("CADS Preset", "Balanced") if d.get("CADS Preset", "Balanced") in PRESETS else "Balanced")),
+            (cads_seed, lambda d: gr.Number.update(value=parse_int(d.get("CADS Seed", DEFAULT_SEED), DEFAULT_SEED))),
+            (cads_seed_fixed, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Fixed Seed", False), False))),
+            (same_noise_per_image, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Same Noise Per Image", False), False))),
+            (share_noise_posneg, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Share Noise Posneg", False), False))),
         ]
         self.paste_field_names = [
             "cads_active",
@@ -205,6 +393,13 @@ class CADSExtensionScript(scripts.Script):
             "cads_noise_scale",
             "cads_mixing_factor",
             "cads_hr_fix_active",
+            "cads_apply_positive",
+            "cads_apply_negative",
+            "cads_preset",
+            "cads_seed",
+            "cads_seed_fixed",
+            "cads_same_noise_per_image",
+            "cads_share_noise_posneg",
         ]
         return [
             active,
@@ -219,6 +414,13 @@ class CADSExtensionScript(scripts.Script):
             mixing_factor,
             rescale,
             apply_to_hr_pass,
+            apply_to_positive,
+            apply_to_negative,
+            presets,
+            cads_seed,
+            cads_seed_fixed,
+            same_noise_per_image,
+            share_noise_posneg,
         ]
 
     def before_process_batch(
@@ -236,17 +438,28 @@ class CADSExtensionScript(scripts.Script):
         mixing_factor,
         rescale,
         apply_to_hr_pass,
+        apply_to_positive,
+        apply_to_negative,
+        presets,
+        cads_seed,
+        cads_seed_fixed,
+        same_noise_per_image,
+        share_noise_posneg,
         *args,
         **kwargs,
     ):
         self.unhook_callbacks()
+        self.cads_generators = {}
+        self.logged_unknown_conditioning = False
+        self.logged_same_noise_warning = False
         active = getattr(p, "cads_active", active)
         if active is False:
             return
 
-        use_step_mode = getattr(p, "cads_use_step_mode", use_step_mode)
-        respect_strength = getattr(p, "cads_respect_strength", respect_strength)
-        ramp_mode = getattr(p, "cads_step_ramp_mode", step_ramp_mode) or STEP_RAMP_MODES[0]
+        use_step_mode = parse_bool(getattr(p, "cads_use_step_mode", use_step_mode), use_step_mode)
+        respect_strength = parse_bool(getattr(p, "cads_respect_strength", respect_strength), respect_strength)
+        ramp_mode_raw = getattr(p, "cads_step_ramp_mode", step_ramp_mode) or STEP_RAMP_MODES[0]
+        ramp_mode = ramp_mode_raw if ramp_mode_raw in STEP_RAMP_MODES else STEP_RAMP_MODES[0]
         step_start = getattr(p, "cads_tau1_step", step_start)
         step_stop = getattr(p, "cads_tau2_step", step_stop)
         steps = getattr(p, "steps", -1)
@@ -295,7 +508,45 @@ class CADSExtensionScript(scripts.Script):
         noise_scale = getattr(p, "cads_noise_scale", noise_scale)
         mixing_factor = getattr(p, "cads_mixing_factor", mixing_factor)
         rescale = getattr(p, "cads_rescale", rescale)
-        apply_to_hr_pass = getattr(p, "cads_hr_fix_active", apply_to_hr_pass)
+        try:
+            noise_scale = max(min(float(noise_scale), 1.0), 0.0)
+        except (TypeError, ValueError):
+            noise_scale = DEFAULT_NOISE_SCALE
+        try:
+            mixing_factor = max(min(float(mixing_factor), 1.0), 0.0)
+        except (TypeError, ValueError):
+            mixing_factor = DEFAULT_MIXING_FACTOR
+        apply_to_hr_pass = parse_bool(getattr(p, "cads_hr_fix_active", apply_to_hr_pass), apply_to_hr_pass)
+        apply_to_positive = parse_bool(getattr(p, "cads_apply_positive", apply_to_positive), apply_to_positive)
+        apply_to_negative = parse_bool(getattr(p, "cads_apply_negative", apply_to_negative), apply_to_negative)
+        preset_name_raw = getattr(p, "cads_preset", presets)
+        preset_name = preset_name_raw if preset_name_raw in PRESETS else "Balanced"
+        cads_seed_value = parse_int(getattr(p, "cads_seed", cads_seed), DEFAULT_SEED)
+        cads_seed_fixed = parse_bool(getattr(p, "cads_seed_fixed", cads_seed_fixed), False)
+        same_noise_per_image = parse_bool(getattr(p, "cads_same_noise_per_image", same_noise_per_image), False)
+        share_noise_posneg = parse_bool(getattr(p, "cads_share_noise_posneg", share_noise_posneg), False)
+        generator_seed = None
+        if cads_seed_value >= 0:
+            generator_seed = cads_seed_value
+        elif cads_seed_fixed:
+            base_seed = getattr(p, "seed", None)
+            if base_seed is None:
+                all_seeds = getattr(p, "all_seeds", None)
+                if isinstance(all_seeds, (list, tuple)) and all_seeds:
+                    base_seed = all_seeds[0]
+            if base_seed == -1:
+                # Treat a random main seed (-1) as “no fixed CADS seed”; fall back to nondeterministic CADS noise.
+                generator_seed = None
+            else:
+                if base_seed is None:
+                    base_seed = torch.seed()
+                try:
+                    generator_seed = int(base_seed)
+                except (TypeError, ValueError):
+                    generator_seed = DEFAULT_SEED
+        if generator_seed is not None and generator_seed < 0:
+            generator_seed = None
+        self.cads_generator_seed = generator_seed if generator_seed is not None and generator_seed >= 0 else None
 
         first_pass_steps = getattr(p, "steps", -1)
         if first_pass_steps <= 0:
@@ -311,28 +562,44 @@ class CADSExtensionScript(scripts.Script):
         setattr(p, "cads_tau2", t2)
         setattr(p, "cads_strength_scale", strength_scale)
         setattr(p, "cads_effective_steps", effective_step_count)
+        setattr(p, "cads_apply_positive", apply_to_positive)
+        setattr(p, "cads_apply_negative", apply_to_negative)
+        setattr(p, "cads_preset", preset_name)
+        setattr(p, "cads_seed", cads_seed_value)
+        setattr(p, "cads_seed_fixed", cads_seed_fixed)
+        setattr(p, "cads_same_noise_per_image", same_noise_per_image)
+        setattr(p, "cads_share_noise_posneg", share_noise_posneg)
 
         if not hasattr(p, "extra_generation_params") or not isinstance(p.extra_generation_params, dict):
             p.extra_generation_params = {}
 
-        p.extra_generation_params.update(
-            {
-                "CADS Active": active,
-                "CADS Use Step Mode": use_step_mode,
-                "CADS Respect Strength": respect_strength,
-                "CADS Step Ramp Mode": ramp_mode,
-                "CADS Tau 1 Step": step_start,
-                "CADS Tau 2 Step": step_stop,
-                "CADS Tau 1": t1,
-                "CADS Tau 2": t2,
-                "CADS Noise Scale": noise_scale,
-                "CADS Mixing Factor": mixing_factor,
-                "CADS Rescale": rescale,
-                "CADS Apply To Hires. Fix": apply_to_hr_pass,
-                "CADS Strength Scale": strength_scale,
-                "CADS Effective Steps": effective_step_count,
-            }
-        )
+        gen_params = {
+            "CADS Active": active,
+            "CADS Use Step Mode": use_step_mode,
+            "CADS Respect Strength": respect_strength,
+            "CADS Step Ramp Mode": ramp_mode if ramp_mode in STEP_RAMP_MODES else STEP_RAMP_MODES[0],
+            "CADS Tau 1 Step": step_start,
+            "CADS Tau 2 Step": step_stop,
+            "CADS Tau 1": t1,
+            "CADS Tau 2": t2,
+            "CADS Noise Scale": noise_scale,
+            "CADS Mixing Factor": mixing_factor,
+            "CADS Rescale": rescale,
+            "CADS Apply To Hires. Fix": apply_to_hr_pass,
+            "CADS Strength Scale": strength_scale,
+            "CADS Effective Steps": effective_step_count,
+            "CADS Apply To Positive": apply_to_positive,
+            "CADS Apply To Negative": apply_to_negative,
+            "CADS Preset": preset_name if preset_name in PRESETS else "Balanced",
+            "CADS Seed": cads_seed_value,
+            "CADS Fixed Seed": cads_seed_fixed,
+            "CADS Same Noise Per Image": same_noise_per_image,
+            "CADS Share Noise Posneg": share_noise_posneg,
+        }
+        if self.cads_generator_seed is not None:
+            gen_params["CADS Effective Seed"] = self.cads_generator_seed
+
+        p.extra_generation_params.update(gen_params)
 
         self.create_hook(
             p,
@@ -344,6 +611,12 @@ class CADSExtensionScript(scripts.Script):
             rescale,
             effective_step_count,
             ramp_mode,
+            apply_to_positive,
+            apply_to_negative,
+            preset_name,
+            self.cads_generator_seed,
+            same_noise_per_image,
+            share_noise_posneg,
         )
 
     def create_hook(
@@ -357,8 +630,12 @@ class CADSExtensionScript(scripts.Script):
         rescale,
         total_sampling_steps,
         ramp_mode,
-        *args,
-        **kwargs,
+        apply_to_positive,
+        apply_to_negative,
+        preset_name,
+        generator_seed,
+        same_noise_per_image,
+        share_noise_posneg,
     ):
         callback = lambda params: self.on_cfg_denoiser_callback(
             params,
@@ -369,6 +646,11 @@ class CADSExtensionScript(scripts.Script):
             rescale=rescale,
             total_sampling_steps=total_sampling_steps,
             ramp_mode=ramp_mode,
+            apply_to_positive=apply_to_positive,
+            apply_to_negative=apply_to_negative,
+            generator_seed=generator_seed,
+            same_noise_per_image=same_noise_per_image,
+            share_noise_posneg=share_noise_posneg,
         )
 
         logger.debug("Hooked callbacks")
@@ -406,23 +688,31 @@ class CADSExtensionScript(scripts.Script):
         # Default to Hold-after / Windowed 0→1 behaviour
         return gamma_up
 
-    def add_noise(self, y, gamma, noise_scale, psi, rescale=False):
+    def add_noise(self, y, gamma, noise_scale, psi, rescale=False, generator=None, noise_override=None):
         """CADS adding noise to the condition."""
         gamma = max(min(float(gamma), 1.0), 0.0)
         base = math.sqrt(gamma)
         residual = math.sqrt(max(1.0 - gamma, 0.0))
-        y_mean, y_std = torch.mean(y), torch.std(y)
-        y = base * y + noise_scale * residual * randn_like(y)
+        psi = max(min(float(psi), 1.0), 0.0)
+        noise_scale = max(min(float(noise_scale), 1.0), 0.0)
+        reduce_dims = tuple(range(1, y.dim())) if y.dim() > 1 else None
+        y_mean = torch.mean(y, dim=reduce_dims, keepdim=reduce_dims is not None)
+        y_std = torch.std(y, dim=reduce_dims, keepdim=reduce_dims is not None, unbiased=False)
+        if noise_override is not None:
+            noise = noise_override
+        else:
+            noise = safe_randn_like(y, generator=generator)
+        y = base * y + noise_scale * residual * noise
         if rescale:
-            denom = torch.std(y)
-            if denom == 0:
+            denom = torch.std(y, dim=reduce_dims, keepdim=reduce_dims is not None, unbiased=False)
+            if torch.any(denom == 0):
                 logger.debug("Warning: zero standard deviation encountered during rescaling")
+            denom = denom.clamp_min(1e-8)
+            y_scaled = (y - torch.mean(y, dim=reduce_dims, keepdim=reduce_dims is not None)) / denom * y_std + y_mean
+            if torch.isfinite(y_scaled).all():
+                y = psi * y_scaled + (1 - psi) * y
             else:
-                y_scaled = (y - torch.mean(y)) / denom * y_std + y_mean
-                if not torch.isnan(y_scaled).any():
-                    y = psi * y_scaled + (1 - psi) * y
-                else:
-                    logger.debug("Warning: NaN encountered in rescaling")
+                logger.debug("Warning: non-finite encountered in rescaling")
         return y
 
     def on_cfg_denoiser_callback(
@@ -435,6 +725,11 @@ class CADSExtensionScript(scripts.Script):
         rescale,
         total_sampling_steps,
         ramp_mode,
+        apply_to_positive,
+        apply_to_negative,
+        generator_seed,
+        same_noise_per_image,
+        share_noise_posneg,
     ):
         sampling_step = params.sampling_step
         total_sampling_step = max(int(total_sampling_steps), 1)
@@ -444,22 +739,74 @@ class CADSExtensionScript(scripts.Script):
         t = 1.0 - max(min((sampling_step + 1) / total_sampling_step, 1.0), 0.0)
         gamma = self.cads_linear_schedule(t, t1, t2, mode=ramp_mode)
 
+        def get_generator(device):
+            if generator_seed is None:
+                return None
+            key = str(device)
+            existing = self.cads_generators.get(key)
+            if existing and existing["seed"] == generator_seed and existing["device"] == device:
+                return existing["generator"]
+            gen = torch.Generator(device=device)
+            gen.manual_seed(generator_seed)
+            self.cads_generators[key] = {"generator": gen, "seed": generator_seed, "device": device}
+            return gen
+
+        if same_noise_per_image and generator_seed is None and not self.logged_same_noise_warning:
+            logger.warning("CADS: Same noise across batch requested but no fixed CADS seed available; disabling shared noise for this run")
+            self.logged_same_noise_warning = True
+            same_noise_per_image = False
+
+        def shared_noise_for_tensor(tensor, gen):
+            """Returns noise matching tensor shape for batch images using a shared generator state."""
+            if not same_noise_per_image or generator_seed is None:
+                return None
+            if tensor.dim() < 1 or tensor.shape[0] < 1 or gen is None:
+                return None
+            base_noise = safe_randn_like(tensor[0], generator=gen)
+            # Broadcast base noise across batch while preserving non-batch dimensions.
+            return base_noise.unsqueeze(0).expand((tensor.shape[0],) + base_noise.shape)
+
         if isinstance(text_cond, torch.Tensor) and isinstance(text_uncond, torch.Tensor):
-            params.text_cond = self.add_noise(text_cond, gamma, noise_scale, mixing_factor, rescale)
-            params.text_uncond = self.add_noise(text_uncond, gamma, noise_scale, mixing_factor, rescale)
+            gen = get_generator(text_cond.device)
+            shared_noise_pos = shared_noise_for_tensor(text_cond, gen) if apply_to_positive else None
+            if apply_to_positive:
+                params.text_cond = self.add_noise(
+                    text_cond, gamma, noise_scale, mixing_factor, rescale, gen, shared_noise_pos
+                )
+            if apply_to_negative:
+                shared_noise_neg = shared_noise_pos if share_noise_posneg else shared_noise_for_tensor(text_uncond, gen)
+                params.text_uncond = self.add_noise(
+                    text_uncond, gamma, noise_scale, mixing_factor, rescale, gen, shared_noise_neg
+                )
         elif isinstance(text_cond, (dict, OrderedDict)) and isinstance(text_uncond, (dict, OrderedDict)):
             for key in ("crossattn", "vector"):
                 if key in text_cond and key in text_uncond:
                     v = text_cond[key]
                     u = text_uncond[key]
                     if isinstance(v, torch.Tensor) and isinstance(u, torch.Tensor):
-                        params.text_cond[key]  = self.add_noise(v, gamma, noise_scale, mixing_factor, rescale)
-                        params.text_uncond[key]= self.add_noise(u, gamma, noise_scale, mixing_factor, rescale)
+                        gen = get_generator(v.device)
+                        shared_noise_pos = shared_noise_for_tensor(v, gen) if apply_to_positive else None
+                        if apply_to_positive:
+                            params.text_cond[key] = self.add_noise(
+                                v, gamma, noise_scale, mixing_factor, rescale, gen, shared_noise_pos
+                            )
+                        if apply_to_negative:
+                            shared_noise_neg = shared_noise_pos if share_noise_posneg else shared_noise_for_tensor(u, gen)
+                            params.text_uncond[key] = self.add_noise(
+                                u, gamma, noise_scale, mixing_factor, rescale, gen, shared_noise_neg
+                            )
         else:
-            logger.error("Unknown text_cond type")
+            if not self.logged_unknown_conditioning:
+                typename = type(text_cond).__name__
+                keys = list(text_cond.keys()) if isinstance(text_cond, dict) else None
+                logger.warning("CADS: Unknown text_cond type (%s) keys=%s; skipping CADS noise", typename, keys)
+                self.logged_unknown_conditioning = True
 
     def before_hr(self, p, *args):
         self.unhook_callbacks()
+        self.cads_generators = {}
+        self.logged_unknown_conditioning = False
+        self.logged_same_noise_warning = False
 
         params = getattr(p, "extra_generation_params", None)
         if not params:
@@ -483,8 +830,39 @@ class CADSExtensionScript(scripts.Script):
         use_step_mode = params.get("CADS Use Step Mode", False)
         respect_strength = params.get("CADS Respect Strength", False)
         ramp_mode = params.get("CADS Step Ramp Mode", STEP_RAMP_MODES[0])
+        if ramp_mode not in STEP_RAMP_MODES:
+            ramp_mode = STEP_RAMP_MODES[0]
         step_start = params.get("CADS Tau 1 Step", 0)
         step_stop = params.get("CADS Tau 2 Step", 0)
+        apply_to_positive = parse_bool(params.get("CADS Apply To Positive", True), True)
+        apply_to_negative = parse_bool(params.get("CADS Apply To Negative", True), True)
+        preset_name_raw = params.get("CADS Preset", "Balanced")
+        preset_name = preset_name_raw if preset_name_raw in PRESETS else "Balanced"
+        same_noise_per_image = parse_bool(params.get("CADS Same Noise Per Image", False), False)
+        share_noise_posneg = parse_bool(params.get("CADS Share Noise Posneg", False), False)
+        generator_seed = parse_int(params.get("CADS Seed", None), None)
+        generator_seed = generator_seed if generator_seed is None or generator_seed >= 0 else None
+        effective_seed = params.get("CADS Effective Seed", None)
+        effective_seed = parse_int(effective_seed, None)
+        if effective_seed is not None and effective_seed < 0:
+            effective_seed = None
+        if effective_seed is None:
+            if generator_seed is None and parse_bool(params.get("CADS Fixed Seed", False), False) and parse_int(params.get("CADS Seed", DEFAULT_SEED), DEFAULT_SEED) < 0:
+                base_seed = getattr(p, "seed", None)
+                if base_seed is None:
+                    all_seeds = getattr(p, "all_seeds", None)
+                    if isinstance(all_seeds, (list, tuple)) and all_seeds:
+                        base_seed = all_seeds[0]
+                if base_seed == -1:
+                    effective_seed = None
+                else:
+                    try:
+                        effective_seed = int(base_seed)
+                    except (TypeError, ValueError):
+                        effective_seed = None
+            else:
+                effective_seed = generator_seed
+        generator_seed = effective_seed
 
         if None in (t1, t2, noise_scale, mixing_factor, rescale):
             logger.error("Missing needed parameters for Hires. fix")
@@ -538,13 +916,29 @@ class CADSExtensionScript(scripts.Script):
             if use_step_mode and respect_strength
             else hr_pass_steps
         )
-        self.create_hook(p, active, t1, t2, noise_scale, mixing_factor, rescale, total_sampling_steps, ramp_mode)
+        self.create_hook(
+            p,
+            active,
+            t1,
+            t2,
+            noise_scale,
+            mixing_factor,
+            rescale,
+            total_sampling_steps,
+            ramp_mode,
+            apply_to_positive,
+            apply_to_negative,
+            preset_name,
+            generator_seed,
+            same_noise_per_image,
+            share_noise_posneg,
+        )
 
 
 def cads_apply_override(field, boolean: bool = False):
     def fun(p, x, xs):
         if boolean:
-            x = True if x.lower() == "true" else False
+            x = True if str(x).lower() == "true" else False
         setattr(p, field, x)
 
     return fun
