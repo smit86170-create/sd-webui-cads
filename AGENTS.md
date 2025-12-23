@@ -1,8 +1,10 @@
-## Review guidelines
-- This repo is an Automatic1111 WebUI extension script. Keep compatibility with common A1111 versions.
-- Do not add heavy dependencies. Use only stdlib + gradio already used by WebUI.
-- Keep changes minimal and well-scoped per PR.
-- Avoid breaking infotext/paste functionality.
-- For SDXL conditioning dicts, keep behavior for keys crossattn and vector.
-- Add clear UI labels/tooltips and keep defaults sane.
-- If you change behavior, update README or UI help text accordingly.
+Task: Create branch `cads-agents-md` in `smit86170-create/sd-webui-cads` and open a PR.
+
+Add a new file `AGENTS.md` in the repo root with guidelines for working on this Automatic1111 WebUI extension:
+- Keep compatibility with common A1111 versions.
+- Do not add new dependencies beyond what WebUI already has.
+- Keep infotext_fields and paste_field_names backward compatible.
+- Prefer small, well-scoped commits.
+- After changes, run: `python -m py_compile scripts/cads.py` and include output in PR description.
+
+Deliverable: PR with only AGENTS.md.
