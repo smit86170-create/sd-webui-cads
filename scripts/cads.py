@@ -151,14 +151,15 @@ class CADSExtensionScript(scripts.Script):
                     interactive=True,
                 )
             with gr.Row():
+                # ИСПРАВЛЕНО: Поменял местами названия и описания слайдеров
                 step_start = gr.Slider(
                     value=0,
                     minimum=0,
                     maximum=1000,
                     step=1,
-                    label="Ramp start step (Tau 2)",
+                    label="Window start step (Tau 2)",
                     elem_id="cads_tau1_step",
-                    info="Sampler step where CADS starts ramping in from 0 → 1 when using step sliders (corresponds to Tau 2 step).",
+                    info="Sampler step where CADS window begins (Tau 2). CADS starts ramping up from this step.",
                     interactive=False,
                 )
                 step_stop = gr.Slider(
@@ -166,9 +167,9 @@ class CADSExtensionScript(scripts.Script):
                     minimum=0,
                     maximum=1000,
                     step=1,
-                    label="Full strength step (Tau 1)",
+                    label="Window end step (Tau 1)",
                     elem_id="cads_tau2_step",
-                    info="Sampler step where CADS reaches full strength before following the selected ramp mode (corresponds to Tau 1 step).",
+                    info="Sampler step where CADS window ends (Tau 1). After this step, behavior depends on ramp mode.",
                     interactive=False,
                 )
             with gr.Row():
@@ -188,168 +189,173 @@ class CADSExtensionScript(scripts.Script):
                     step=0.05,
                     label="Tau 2 (ramp start)",
                     elem_id="cads_tau2",
-                    info="Normalized point where CADS starts ramping in from 0 → 1; higher values start earlier in the schedule. Default 0.9",
+                    info="Normalized point where CADS begins ramping up from zero; larger values start earlier. Must be >= Tau 1. Default 0.9",
                 )
             with gr.Row():
-                noise_scale = gr.Slider(
+                noise_scale_slider = gr.Slider(
                     value=DEFAULT_NOISE_SCALE,
                     minimum=0.0,
                     maximum=1.0,
-                    step=0.01,
+                    step=0.05,
                     label="Noise Scale",
                     elem_id="cads_noise_scale",
-                    info="Scale of noise injected at every time step, default 0.25, recommended <= 0.3",
+                    info="How much random noise is mixed in. Higher values = more variation. Default 0.25",
                 )
-                mixing_factor = gr.Slider(
+                mixing_factor_slider = gr.Slider(
                     value=DEFAULT_MIXING_FACTOR,
                     minimum=0.0,
                     maximum=1.0,
-                    step=0.01,
-                    label="Mixing Factor",
+                    step=0.05,
+                    label="Mixing Factor (Psi)",
                     elem_id="cads_mixing_factor",
-                    info="Regularization factor, lowering this will increase the diversity of the images with more chance of divergence, default 1.0",
+                    info="Interpolation factor during CFG rescaling. 1.0 = full rescale, 0.0 = no rescale. Default 1.0",
                 )
-            with gr.Accordion("Experimental", open=False):
-                apply_to_hr_pass = gr.Checkbox(
-                    value=False,
-                    default=False,
-                    label="Apply to Hires. Fix",
-                    elem_id="cads_hr_fix_active",
-                    info="Requires a very high denoising value to work. Default False",
-                )
-            with gr.Row():
-                apply_to_positive = gr.Checkbox(
-                    value=True,
-                    default=True,
-                    label="Apply to Positive",
-                    elem_id="cads_apply_positive",
-                )
-                apply_to_negative = gr.Checkbox(
-                    value=True,
-                    default=True,
-                    label="Apply to Negative",
-                    elem_id="cads_apply_negative",
-                )
-            with gr.Row():
-                presets = gr.Dropdown(
-                    value="Balanced",
-                    choices=list(PRESETS.keys()),
-                    label="Presets",
-                    elem_id="cads_preset",
-                    info="Quickly load suggested Tau and noise settings.",
-                )
-                reset = gr.Button(value="Reset", elem_id="cads_reset")
-            with gr.Row():
-                cads_seed = gr.Number(
-                    value=DEFAULT_SEED,
-                    precision=0,
-                    label="CADS Seed",
-                    elem_id="cads_seed",
-                    info="Seed used only for CADS noise (-1 follows main randomness).",
-                )
-                cads_seed_fixed = gr.Checkbox(
-                    value=False,
-                    default=False,
-                    label="Fixed CADS Seed",
-                    elem_id="cads_seed_fixed",
-                    info="Use a dedicated RNG for CADS noise so it can be varied independently from the main seed.",
-                )
-            with gr.Row():
-                same_noise_per_image = gr.Checkbox(
-                    value=False,
-                    default=False,
-                    label="Same CADS noise across batch",
-                    elem_id="cads_same_noise_per_image",
-                    info="Requires a fixed CADS seed. When enabled, each image in a batch receives identical CADS noise per step (helpful for side-by-side comparisons).",
-                    interactive=False,
-                )
-                share_noise_posneg = gr.Checkbox(
-                    value=False,
-                    default=False,
-                    label="Share noise between pos/neg",
-                    elem_id="cads_share_noise_posneg",
-                    info="When enabled, positive and negative conditionings share the same CADS noise sample per step.",
-                )
+            with gr.Accordion("Advanced Options", open=False):
+                with gr.Row():
+                    apply_to_hr = gr.Checkbox(
+                        value=False,
+                        default=False,
+                        label="Apply to Hires. fix",
+                        elem_id="cads_hr_fix_active",
+                        info="Apply CADS during the Hires. fix pass.",
+                    )
+                    apply_positive = gr.Checkbox(
+                        value=True,
+                        default=True,
+                        label="Apply to positive prompt",
+                        elem_id="cads_apply_positive",
+                        info="Add CADS noise to the positive conditioning.",
+                    )
+                    apply_negative = gr.Checkbox(
+                        value=True,
+                        default=True,
+                        label="Apply to negative prompt",
+                        elem_id="cads_apply_negative",
+                        info="Add CADS noise to the negative conditioning.",
+                    )
+                with gr.Row():
+                    preset_dropdown = gr.Dropdown(
+                        value="Balanced",
+                        choices=list(PRESETS.keys()),
+                        label="Preset",
+                        elem_id="cads_preset",
+                        info="Quick parameter sets: Subtle, Balanced, or Aggressive.",
+                    )
+                    apply_preset_button = gr.Button("Apply Preset", elem_id="cads_apply_preset")
+                    reset_button = gr.Button("Reset defaults", elem_id="cads_reset")
+                with gr.Row():
+                    cads_seed = gr.Number(
+                        value=DEFAULT_SEED,
+                        minimum=-1,
+                        step=1,
+                        label="CADS Seed",
+                        elem_id="cads_seed",
+                        info="Seed for CADS noise generation. -1 for random.",
+                        precision=0,
+                    )
+                    cads_seed_fixed = gr.Checkbox(
+                        value=False,
+                        default=False,
+                        label="Use fixed CADS seed",
+                        elem_id="cads_seed_fixed",
+                        info="If CADS seed is -1 and this is enabled, use the main generation seed for CADS noise.",
+                    )
+                with gr.Row():
+                    same_noise_per_image = gr.Checkbox(
+                        value=False,
+                        default=False,
+                        label="Same CADS noise across batch",
+                        elem_id="cads_same_noise_per_image",
+                        info="All images in a batch use identical CADS noise. Requires a fixed CADS seed.",
+                    )
+                    share_noise_posneg = gr.Checkbox(
+                        value=False,
+                        default=False,
+                        label="Share noise between pos/neg",
+                        elem_id="cads_share_noise_posneg",
+                        info="Positive and negative prompts receive the same CADS noise.",
+                    )
 
-        def toggle_step_sliders(enabled):
-            slider_enabled = gr.Slider.update(interactive=enabled)
-            slider_disabled = gr.Slider.update(interactive=not enabled)
-            checkbox_enabled = gr.Checkbox.update(interactive=enabled)
-            dropdown_enabled = gr.Dropdown.update(interactive=True)
-            return (
-                slider_enabled,
-                slider_enabled,
-                slider_disabled,
-                slider_disabled,
-                checkbox_enabled,
-                dropdown_enabled,
+            def on_apply_preset(preset_name):
+                if preset_name in PRESETS:
+                    preset_vals = PRESETS[preset_name]
+                    return (
+                        preset_vals.get("tau1", DEFAULT_TAU1),
+                        preset_vals.get("tau2", DEFAULT_TAU2),
+                        preset_vals.get("noise_scale", DEFAULT_NOISE_SCALE),
+                        preset_vals.get("mixing_factor", DEFAULT_MIXING_FACTOR),
+                    )
+                return (DEFAULT_TAU1, DEFAULT_TAU2, DEFAULT_NOISE_SCALE, DEFAULT_MIXING_FACTOR)
+
+            apply_preset_button.click(
+                fn=on_apply_preset,
+                inputs=[preset_dropdown],
+                outputs=[t1, t2, noise_scale_slider, mixing_factor_slider],
             )
 
-        use_step_mode.change(
-            fn=toggle_step_sliders,
-            inputs=use_step_mode,
-            outputs=[step_start, step_stop, t1, t2, respect_strength, step_ramp_mode],
-        )
+            def on_reset_defaults():
+                info = "All images in a batch use identical CADS noise. Requires a fixed CADS seed."
+                return (
+                    gr.update(value=DEFAULT_TAU1),
+                    gr.update(value=DEFAULT_TAU2),
+                    gr.update(value=DEFAULT_NOISE_SCALE),
+                    gr.update(value=DEFAULT_MIXING_FACTOR),
+                    gr.update(value="Balanced"),
+                    gr.update(value=DEFAULT_SEED),
+                    gr.update(value=False),
+                    gr.update(value=False, interactive=False, info=info),
+                )
 
-        def update_same_noise_enabled(seed_val, fixed):
-            seed_int = parse_int(seed_val, DEFAULT_SEED)
-            has_fixed_seed = seed_int >= 0 or parse_bool(fixed, False)
-            info = "Requires a fixed CADS seed. When enabled, each image in a batch receives identical CADS noise per step (helpful for comparisons)."
-            if has_fixed_seed:
-                return gr.Checkbox.update(interactive=True, info=info)
-            return gr.Checkbox.update(interactive=False, value=False, info=info)
-
-        cads_seed.change(
-            fn=update_same_noise_enabled,
-            inputs=[cads_seed, cads_seed_fixed],
-            outputs=same_noise_per_image,
-        )
-        cads_seed_fixed.change(
-            fn=update_same_noise_enabled,
-            inputs=[cads_seed, cads_seed_fixed],
-            outputs=same_noise_per_image,
-        )
-
-        def apply_preset(preset_name):
-            preset = PRESETS.get(preset_name, PRESETS["Balanced"])
-            info = "Requires a fixed CADS seed. When enabled, each image in a batch receives identical CADS noise per step (helpful for comparisons)."
-            return (
-                gr.Slider.update(value=preset["tau2"]),
-                gr.Slider.update(value=preset["tau1"]),
-                gr.Slider.update(value=preset["noise_scale"]),
-                gr.Slider.update(value=preset["mixing_factor"]),
-                gr.Number.update(value=DEFAULT_SEED),
-                gr.Checkbox.update(value=False),
-                # Programmatic updates don't always trigger .change() handlers; keep UI consistent.
-                gr.Checkbox.update(value=False, interactive=False, info=info),
+            reset_button.click(
+                fn=on_reset_defaults,
+                inputs=None,
+                outputs=[t1, t2, noise_scale_slider, mixing_factor_slider, preset_dropdown,
+                         cads_seed, cads_seed_fixed, same_noise_per_image],
             )
 
-        presets.change(
-            fn=apply_preset,
-            inputs=presets,
-            outputs=[t2, t1, noise_scale, mixing_factor, cads_seed, cads_seed_fixed, same_noise_per_image],
-        )
+            def update_step_sliders(use_step_mode_val):
+                if use_step_mode_val:
+                    return (
+                        gr.update(interactive=True),
+                        gr.update(interactive=True),
+                        gr.update(interactive=True),
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                    )
+                return (
+                    gr.update(interactive=False),
+                    gr.update(interactive=False),
+                    gr.update(interactive=False),
+                    gr.update(interactive=True),
+                    gr.update(interactive=True),
+                )
 
-        def reset_defaults():
-            info = "Requires a fixed CADS seed. When enabled, each image in a batch receives identical CADS noise per step (helpful for comparisons)."
-            return (
-                gr.Slider.update(value=DEFAULT_TAU2),
-                gr.Slider.update(value=DEFAULT_TAU1),
-                gr.Slider.update(value=DEFAULT_NOISE_SCALE),
-                gr.Slider.update(value=DEFAULT_MIXING_FACTOR),
-                gr.Dropdown.update(value="Balanced"),
-                gr.Number.update(value=DEFAULT_SEED),
-                gr.Checkbox.update(value=False),
-                # Programmatic updates don't always trigger .change() handlers; keep UI consistent.
-                gr.Checkbox.update(value=False, interactive=False, info=info),
+            use_step_mode.change(
+                fn=update_step_sliders,
+                inputs=[use_step_mode],
+                outputs=[step_start, step_stop, respect_strength, t1, t2],
             )
 
-        reset.click(
-            fn=reset_defaults,
-            inputs=None,
-            outputs=[t2, t1, noise_scale, mixing_factor, presets, cads_seed, cads_seed_fixed, same_noise_per_image],
-        )
+            def update_same_noise_enabled(seed_val, fixed):
+                seed_int = parse_int(seed_val, DEFAULT_SEED)
+                has_fixed_seed = seed_int >= 0 or parse_bool(fixed, False)
+                info = "All images in a batch use identical CADS noise. Requires a fixed CADS seed."
+                if has_fixed_seed:
+                    return gr.update(interactive=True, info=info)
+                return gr.update(interactive=False, value=False, info=info)
 
+            cads_seed.change(
+                fn=update_same_noise_enabled,
+                inputs=[cads_seed, cads_seed_fixed],
+                outputs=same_noise_per_image,
+            )
+            cads_seed_fixed.change(
+                fn=update_same_noise_enabled,
+                inputs=[cads_seed, cads_seed_fixed],
+                outputs=same_noise_per_image,
+            )
+
+        # Запрещаем A1111 сохранять состояние UI-компонентов в ui-config.json
         active.do_not_save_to_config = True
         rescale.do_not_save_to_config = True
         use_step_mode.do_not_save_to_config = True
@@ -357,30 +363,44 @@ class CADSExtensionScript(scripts.Script):
         step_ramp_mode.do_not_save_to_config = True
         step_start.do_not_save_to_config = True
         step_stop.do_not_save_to_config = True
-        apply_to_hr_pass.do_not_save_to_config = True
-        presets.do_not_save_to_config = True
-        reset.do_not_save_to_config = True
+        t1.do_not_save_to_config = True
+        t2.do_not_save_to_config = True
+        noise_scale_slider.do_not_save_to_config = True
+        mixing_factor_slider.do_not_save_to_config = True
+        apply_to_hr.do_not_save_to_config = True
+        apply_positive.do_not_save_to_config = True
+        apply_negative.do_not_save_to_config = True
+        preset_dropdown.do_not_save_to_config = True
+        apply_preset_button.do_not_save_to_config = True
+        reset_button.do_not_save_to_config = True
+        cads_seed.do_not_save_to_config = True
         cads_seed_fixed.do_not_save_to_config = True
         same_noise_per_image.do_not_save_to_config = True
         share_noise_posneg.do_not_save_to_config = True
 
-        # Keep Tau step infotext keys as legacy names for backward compatibility with existing images.
+        # Восстановление настроек из PNG Info / Send to txt2img
         self.infotext_fields = [
             (active, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Active", False), False))),
             (rescale, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Rescale", True), True))),
             (use_step_mode, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Use Step Mode", False), False))),
             (respect_strength, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Respect Strength", False), False))),
-            (step_ramp_mode, lambda d: gr.Dropdown.update(value=d.get("CADS Step Ramp Mode", STEP_RAMP_MODES[0]) if d.get("CADS Step Ramp Mode", STEP_RAMP_MODES[0]) in STEP_RAMP_MODES else STEP_RAMP_MODES[0])),
+            (step_ramp_mode, lambda d: gr.Dropdown.update(
+                value=d.get("CADS Step Ramp Mode", STEP_RAMP_MODES[0])
+                if d.get("CADS Step Ramp Mode", STEP_RAMP_MODES[0]) in STEP_RAMP_MODES
+                else STEP_RAMP_MODES[0]
+            )),
             (step_start, "CADS Tau 1 Step"),
             (step_stop, "CADS Tau 2 Step"),
             (t1, "CADS Tau 1"),
             (t2, "CADS Tau 2"),
-            (noise_scale, "CADS Noise Scale"),
-            (mixing_factor, "CADS Mixing Factor"),
-            (apply_to_hr_pass, "CADS Apply To Hires. Fix"),
-            (apply_to_positive, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Apply To Positive", True), True))),
-            (apply_to_negative, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Apply To Negative", True), True))),
-            (presets, lambda d: gr.Dropdown.update(value=d.get("CADS Preset", "Balanced") if d.get("CADS Preset", "Balanced") in PRESETS else "Balanced")),
+            (noise_scale_slider, "CADS Noise Scale"),
+            (mixing_factor_slider, "CADS Mixing Factor"),
+            (apply_to_hr, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Apply To Hires. Fix", False), False))),
+            (apply_positive, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Apply To Positive", True), True))),
+            (apply_negative, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Apply To Negative", True), True))),
+            (preset_dropdown, lambda d: gr.Dropdown.update(
+                value=d.get("CADS Preset", "Balanced") if d.get("CADS Preset", "Balanced") in PRESETS else "Balanced"
+            )),
             (cads_seed, lambda d: gr.Number.update(value=parse_int(d.get("CADS Seed", DEFAULT_SEED), DEFAULT_SEED))),
             (cads_seed_fixed, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Fixed Seed", False), False))),
             (same_noise_per_image, lambda d: gr.Checkbox.update(value=parse_bool(d.get("CADS Same Noise Per Image", False), False))),
@@ -407,8 +427,10 @@ class CADSExtensionScript(scripts.Script):
             "cads_same_noise_per_image",
             "cads_share_noise_posneg",
         ]
+
         return [
             active,
+            rescale,
             use_step_mode,
             respect_strength,
             step_ramp_mode,
@@ -416,13 +438,12 @@ class CADSExtensionScript(scripts.Script):
             step_stop,
             t1,
             t2,
-            noise_scale,
-            mixing_factor,
-            rescale,
-            apply_to_hr_pass,
-            apply_to_positive,
-            apply_to_negative,
-            presets,
+            noise_scale_slider,
+            mixing_factor_slider,
+            apply_to_hr,
+            apply_positive,
+            apply_negative,
+            preset_dropdown,
             cads_seed,
             cads_seed_fixed,
             same_noise_per_image,
@@ -433,16 +454,16 @@ class CADSExtensionScript(scripts.Script):
         self,
         p,
         active,
+        rescale,
         use_step_mode,
         respect_strength,
-        step_ramp_mode,
+        ramp_mode,
         step_start,
         step_stop,
         t1,
         t2,
         noise_scale,
         mixing_factor,
-        rescale,
         apply_to_hr_pass,
         apply_to_positive,
         apply_to_negative,
@@ -454,34 +475,25 @@ class CADSExtensionScript(scripts.Script):
         *args,
         **kwargs,
     ):
-        self.unhook_callbacks()
         self.cads_generators = {}
         self.logged_unknown_conditioning = False
         self.logged_same_noise_warning = False
-        active = parse_bool(getattr(p, "cads_active", active), False)
+
         if not active:
+            logger.debug("Disabled by user")
             return
 
-        use_step_mode = parse_bool(getattr(p, "cads_use_step_mode", use_step_mode), use_step_mode)
-        respect_strength = parse_bool(getattr(p, "cads_respect_strength", respect_strength), respect_strength)
-        ramp_mode_raw = getattr(p, "cads_step_ramp_mode", step_ramp_mode) or STEP_RAMP_MODES[0]
-        ramp_mode = ramp_mode_raw if ramp_mode_raw in STEP_RAMP_MODES else STEP_RAMP_MODES[0]
-        step_start = parse_int(getattr(p, "cads_tau1_step", step_start), step_start)
-        step_stop  = parse_int(getattr(p, "cads_tau2_step", step_stop),  step_stop)
         steps = getattr(p, "steps", -1)
-        if use_step_mode and steps <= 0:
-            logger.error("Steps not set, disabling CADS step sliders")
-            use_step_mode = False
+        if steps <= 0:
+            logger.error("Steps not set, disabling CADS")
+            return
 
+        # Convert from UI parameters
         strength_scale = 1.0
-        effective_steps_float = float(max(steps, 1))
-        effective_step_count = max(int(round(effective_steps_float)), 1)
+        effective_step_count = steps
+
         if use_step_mode:
-            step_start = int(max(min(step_start, steps), 0))
-            step_stop = int(max(min(step_stop, steps), 0))
-            if step_stop < step_start:
-                step_stop = step_start
-            steps_float = float(max(steps, 1))
+            effective_steps_float = float(max(steps, 1))
             if respect_strength:
                 strength_raw = getattr(p, "denoising_strength", None)
                 try:
@@ -492,15 +504,23 @@ class CADSExtensionScript(scripts.Script):
                     strength_scale = 1.0
                 strength_scale = max(min(strength_scale, 1.0), 0.0)
                 if strength_scale == 0.0:
-                    logger.warning("CADS: Denoising strength is 0.0, falling back to 1.0 for step conversion")
+                    logger.warning("CADS: denoising strength is 0.0, falling back to 1.0 for step conversion")
                     strength_scale = 1.0
-                effective_steps_float = max(steps_float * strength_scale, 1.0)
-                effective_step_count = max(int(round(effective_steps_float)), 1)
-                step_start = int(max(min(step_start, effective_step_count), 0))
-                step_stop = int(max(min(step_stop, effective_step_count), 0))
-                if step_stop < step_start:
-                    step_stop = step_start
-                steps_float = effective_steps_float
+                effective_steps_float = max(effective_steps_float * strength_scale, 1.0)
+            effective_step_count = max(int(round(effective_steps_float)), 1)
+            step_start = int(max(min(step_start, effective_step_count), 0))
+            step_stop = int(max(min(step_stop, effective_step_count), 0))
+            
+            # ИСПРАВЛЕНО: Добавлена валидация и предупреждение
+            if step_stop < step_start:
+                logger.warning(f"CADS: Window end step ({step_stop}) is less than window start step ({step_start}). Setting end = start.")
+                step_stop = step_start
+            
+            # ИСПРАВЛЕНО: Добавлена информация о пустом окне
+            if step_stop == step_start and ramp_mode.startswith("Windowed"):
+                logger.warning(f"CADS: Window has zero width (start={step_start}, end={step_stop}). CADS will have no effect in {ramp_mode} mode.")
+            
+            steps_float = effective_steps_float
             t1 = max(min(1.0 - (step_stop / steps_float), 1.0), 0.0)
             t2 = max(min(1.0 - (step_start / steps_float), 1.0), 0.0)
         else:
@@ -549,7 +569,7 @@ class CADSExtensionScript(scripts.Script):
                 if isinstance(all_seeds, (list, tuple)) and all_seeds:
                     base_seed = all_seeds[0]
             if base_seed == -1:
-                # Treat a random main seed (-1) as “no fixed CADS seed”; fall back to nondeterministic CADS noise.
+                # Treat a random main seed (-1) as "no fixed CADS seed"; fall back to nondeterministic CADS noise.
                 generator_seed = None
             else:
                 if base_seed is None:
@@ -679,7 +699,11 @@ class CADSExtensionScript(scripts.Script):
         script_callbacks.remove_current_script_callbacks()
 
     def cads_linear_schedule(self, t, tau1, tau2, mode):
-        """CADS annealing schedule function."""
+        """
+        CADS annealing schedule function.
+        
+        ИСПРАВЛЕНО: Для windowed режимов возвращает 0.0 за пределами окна tau1-tau2
+        """
         tau1 = float(max(min(tau1, 1.0), 0.0))
         tau2 = float(max(min(tau2, 1.0), 0.0))
 
@@ -688,6 +712,13 @@ class CADSExtensionScript(scripts.Script):
                 return 1.0 if t <= tau1 else 0.0
             return 0.0
 
+        # ИСПРАВЛЕНО: Для windowed режимов - строгая проверка границ
+        if mode in ("Windowed 0→1", "Windowed 1→0"):
+            # За пределами окна [tau1, tau2] - полностью отключаем CADS
+            if t > tau2 or t < tau1:
+                return 0.0
+        
+        # Стандартная логика для области внутри окна
         if t >= tau2:
             return 0.0
         if t <= tau1:
@@ -703,8 +734,17 @@ class CADSExtensionScript(scripts.Script):
         return gamma_up
 
     def add_noise(self, y, gamma, noise_scale, psi, rescale=False, generator=None, noise_override=None):
-        """CADS adding noise to the condition."""
+        """
+        CADS adding noise to the condition.
+        
+        ИСПРАВЛЕНО: Если gamma = 0.0, возвращаем исходный тензор без изменений
+        """
         gamma = max(min(float(gamma), 1.0), 0.0)
+        
+        # ИСПРАВЛЕНО: Ранний выход если gamma = 0 (CADS отключен)
+        if gamma == 0.0:
+            return y
+        
         base = math.sqrt(gamma)
         residual = math.sqrt(max(1.0 - gamma, 0.0))
         psi = max(min(float(psi), 1.0), 0.0)
@@ -752,6 +792,10 @@ class CADSExtensionScript(scripts.Script):
 
         t = 1.0 - max(min((sampling_step + 1) / total_sampling_step, 1.0), 0.0)
         gamma = self.cads_linear_schedule(t, t1, t2, mode=ramp_mode)
+        
+        # ИСПРАВЛЕНО: Ранний выход если gamma = 0 (CADS неактивен на этом шаге)
+        if gamma == 0.0:
+            return
 
         def get_generator(device):
             if generator_seed is None:
@@ -939,8 +983,12 @@ class CADSExtensionScript(scripts.Script):
             effective_step_count = max(int(round(steps_float)), 1)
             step_start = int(max(min(step_start, effective_step_count), 0))
             step_stop = int(max(min(step_stop, effective_step_count), 0))
+            
+            # ИСПРАВЛЕНО: Валидация для Hires fix
             if step_stop < step_start:
+                logger.warning(f"CADS Hires.fix: Window end step ({step_stop}) < start step ({step_start}). Setting end = start.")
                 step_stop = step_start
+            
             t1 = max(min(1.0 - (step_stop / steps_float), 1.0), 0.0)
             t2 = max(min(1.0 - (step_start / steps_float), 1.0), 0.0)
             params["CADS Tau 1 Step"] = step_start
